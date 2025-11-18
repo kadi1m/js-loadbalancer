@@ -22,6 +22,8 @@ targets.forEach((target) => {
     isHealthy: true,
     failures: 0,
     successes: 0,
+    latency: null, // Latency in milliseconds
+    lastCheck: null, // Timestamp of last health check
   });
 });
 
@@ -47,14 +49,23 @@ function getTargetForIp(ip) {
     sessionMap.delete(ip);
   }
 
-  // Failover mode: if service 1 is down, forward all traffic to service 2
+  // Failover mode: prefer service 1, only use service 2 if service 1 is down
   if (config.failover.enabled && targets.length >= 2) {
     const service1 = targets[0];
     const service2 = targets[1];
     const service1Health = targetHealth.get(service1);
     const service2Health = targetHealth.get(service2);
 
-    // If service 1 is down and service 2 is healthy, route to service 2
+    // Always prefer service 1 if it's healthy
+    if (service1Health && service1Health.isHealthy) {
+      const target = service1;
+      if (config.stickySession.enabled) {
+        sessionMap.set(ip, target);
+      }
+      return target;
+    }
+
+    // Only use service 2 if service 1 is down and service 2 is healthy
     if (service1Health && !service1Health.isHealthy && service2Health && service2Health.isHealthy) {
       const target = service2;
       if (config.stickySession.enabled) {
@@ -64,6 +75,7 @@ function getTargetForIp(ip) {
     }
   }
 
+  // Fallback: if failover is disabled or other cases, use round-robin
   const healthyTargets = getHealthyTargets();
   if (healthyTargets.length === 0) {
     console.warn(`[${new Date().toISOString()}] No healthy targets available!`);
@@ -83,10 +95,11 @@ function getTargetForIp(ip) {
 async function checkTargetHealth(target) {
   return new Promise((resolve) => {
     if (isShuttingDown) {
-      resolve({ isHealthy: false, error: "Shutting down" });
+      resolve({ isHealthy: false, error: "Shutting down", latency: null });
       return;
     }
 
+    const startTime = Date.now();
     const healthConfig = config.healthCheck;
     const url = new URL(target);
     url.pathname = healthConfig.path;
@@ -106,27 +119,30 @@ async function checkTargetHealth(target) {
       // Only consider status code 200 as healthy
       const isHealthy = res.statusCode === 200;
       const statusCode = res.statusCode;
+      const latency = Date.now() - startTime;
       activeHealthCheckRequests.delete(req);
       
       if (!isHealthy) {
         console.log(`[${new Date().toISOString()}] Health check for ${target} returned status ${statusCode} (expected 200)`);
       }
       
-      resolve({ isHealthy, error: null, statusCode });
+      resolve({ isHealthy, error: null, statusCode, latency });
       req.destroy();
     });
 
     req.on("error", (err) => {
+      const latency = Date.now() - startTime;
       activeHealthCheckRequests.delete(req);
       console.log(`[${new Date().toISOString()}] Health check error for ${target}: ${err.message}`);
-      resolve({ isHealthy: false, error: err.message });
+      resolve({ isHealthy: false, error: err.message, latency });
     });
 
     req.on("timeout", () => {
+      const latency = Date.now() - startTime;
       activeHealthCheckRequests.delete(req);
       req.destroy();
       console.log(`[${new Date().toISOString()}] Health check timeout for ${target}`);
-      resolve({ isHealthy: false, error: "Timeout" });
+      resolve({ isHealthy: false, error: "Timeout", latency });
     });
 
     activeHealthCheckRequests.add(req);
@@ -139,13 +155,19 @@ async function performHealthCheck(target) {
   const health = targetHealth.get(target);
   const healthConfig = config.healthCheck;
 
+  // Update latency and last check time
+  if (result.latency !== null) {
+    health.latency = result.latency;
+  }
+  health.lastCheck = new Date().toISOString();
+
   if (result.isHealthy) {
     health.successes += 1;
     health.failures = 0;
 
     if (!health.isHealthy && health.successes >= healthConfig.healthyThreshold) {
       health.isHealthy = true;
-      console.log(`[${new Date().toISOString()}] Target ${target} is now HEALTHY (status: ${result.statusCode || 200})`);
+      console.log(`[${new Date().toISOString()}] Target ${target} is now HEALTHY (status: ${result.statusCode || 200}, latency: ${result.latency}ms)`);
     }
   } else {
     health.successes = 0;
@@ -203,6 +225,25 @@ function stopHealthChecks() {
 }
 
 const server = http.createServer((req, res) => {
+  // Handle status endpoint
+  if (req.url === '/status' && req.method === 'GET') {
+    const statusData = targets.map((target) => {
+      const health = targetHealth.get(target);
+      return {
+        url: target,
+        alive: health ? health.isHealthy : false,
+        latency: health && health.latency !== null ? health.latency : null,
+        lastCheck: health ? health.lastCheck : null,
+        failures: health ? health.failures : 0,
+        successes: health ? health.successes : 0,
+      };
+    });
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(statusData, null, 2));
+    return;
+  }
+
   const ip = getClientIp(req);
   const target = getTargetForIp(ip);
 
@@ -226,6 +267,16 @@ const server = http.createServer((req, res) => {
 
   // Configure proxy options for HTTPS targets
   const url = new URL(target);
+  
+  // Get the original protocol (http or https) from the request
+  const protocol = req.socket.encrypted ? 'https' : 'http';
+  
+  // Preserve existing X-Forwarded-For or create new one
+  const existingForwardedFor = req.headers['x-forwarded-for'];
+  const forwardedFor = existingForwardedFor 
+    ? `${existingForwardedFor}, ${ip}`
+    : ip;
+  
   const proxyOptions = {
     target: target,
     // For HTTPS targets, don't reject unauthorized certificates
@@ -233,6 +284,13 @@ const server = http.createServer((req, res) => {
       secure: false, // Don't reject unauthorized SSL certificates
       changeOrigin: true, // Change the origin of the host header to the target URL
     }),
+    // Forward proper headers
+    headers: {
+      'X-Forwarded-For': forwardedFor,
+      'X-Forwarded-Proto': protocol,
+      'X-Real-IP': ip,
+      'X-Forwarded-Host': req.headers.host || url.hostname,
+    },
   };
 
   proxy.web(req, res, proxyOptions, (err) => {
@@ -262,9 +320,61 @@ const server = http.createServer((req, res) => {
   });
 });
 
+// Handle WebSocket upgrades
+server.on('upgrade', (req, socket, head) => {
+  const ip = getClientIp(req);
+  const target = getTargetForIp(ip);
+
+  if (!target) {
+    console.log(`[${new Date().toISOString()}] WebSocket upgrade rejected - No healthy targets available for IP: ${ip}`);
+    socket.destroy();
+    return;
+  }
+
+  console.log(`[${new Date().toISOString()}] WebSocket upgrade: IP: ${ip} -> Target: ${target} | Path: ${req.url}`);
+
+  const url = new URL(target);
+  const protocol = req.socket.encrypted ? 'https' : 'http';
+  
+  // Preserve existing X-Forwarded-For or create new one
+  const existingForwardedFor = req.headers['x-forwarded-for'];
+  const forwardedFor = existingForwardedFor 
+    ? `${existingForwardedFor}, ${ip}`
+    : ip;
+
+  const proxyOptions = {
+    target: target,
+    ...(url.protocol === "https:" && {
+      secure: false,
+      changeOrigin: true,
+    }),
+    // Forward proper headers for WebSocket
+    headers: {
+      'X-Forwarded-For': forwardedFor,
+      'X-Forwarded-Proto': protocol,
+      'X-Real-IP': ip,
+      'X-Forwarded-Host': req.headers.host || url.hostname,
+    },
+  };
+
+  proxy.ws(req, socket, head, proxyOptions, (err) => {
+    if (err) {
+      console.error(`[${new Date().toISOString()}] WebSocket proxy error for ${target}:`, err.message);
+      
+      const health = targetHealth.get(target);
+      if (health) {
+        health.failures += 1;
+        performHealthCheck(target);
+      }
+    }
+    socket.destroy();
+  });
+});
+
 server.listen(config.server.port, config.server.host, () => {
   console.log(`Sticky load balancer running on http://${config.server.host}:${config.server.port}`);
   console.log(`Sticky sessions: ${config.stickySession.enabled ? "ENABLED" : "DISABLED"}`);
+  console.log(`WebSocket support: ENABLED`);
   startHealthChecks();
 });
 
