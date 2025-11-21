@@ -5,8 +5,8 @@ import { config } from "./config.js";
 
 const proxy = httpProxy.createProxyServer({});
 const targets = [
-  "https://ha.screenshare.lol",
-  "https://ha2.screenshare.lol",
+  "https://h1.example.com",
+  "https://h2.example.com",
 ];
 
 const sessionMap = new Map();
